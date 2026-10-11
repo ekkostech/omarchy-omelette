@@ -166,6 +166,36 @@ class Setup(unittest.TestCase):
             self.assertEqual(path.read_text(), "-- mine\n")
             self.assertEqual(self.run_setup(home, args=["--remove"]), 0)
 
+    def test_backups_keep_a_private_config_private(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = Path(home, ".config/hypr/bindings.lua")
+            path.parent.mkdir(parents=True)
+            path.write_text("-- mine\n")
+            path.chmod(0o600)
+            old = os.umask(0o022)
+            try:
+                self.run_setup(home)
+                self.run_setup(home, args=["--remove"])
+            finally:
+                os.umask(old)
+            backups = sorted(path.parent.glob("bindings.lua.bak.omelette.*"))
+            self.assertEqual(len(backups), 2)  # setup, then --remove (a same-second clash gets a suffix)
+            for b in backups:
+                self.assertEqual(b.stat().st_mode & 0o777, 0o600, b.name)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_runtime_state_is_owner_only(self):
+        with tempfile.TemporaryDirectory() as run:
+            state = os.path.join(run, "omelette.json")
+            old = os.umask(0o022)
+            try:
+                with mock.patch.object(om, "STATE", state):
+                    om.save_state({"index": 0})
+                    self.assertEqual(om.load_state(), {"index": 0})
+            finally:
+                os.umask(old)
+            self.assertEqual(os.stat(state).st_mode & 0o777, 0o600)
+
     def test_skips_combos_already_in_use(self):
         with tempfile.TemporaryDirectory() as home:
             path = Path(home, ".config/hypr/bindings.lua")

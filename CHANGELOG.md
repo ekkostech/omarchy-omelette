@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.0.2 (2026-10-11)
+
+- `omelette setup` and `setup --remove` back up `bindings.lua` with the original file's permissions, so a private config never leaves a world-readable copy. A second backup in the same second gets a suffix instead of overwriting the first.
+- The runtime session and lock files are created owner-only (`0600`).
+
 ## 1.0.1 (2026-10-11)
 
 - `omelette setup --remove` takes the shortcuts block back out of `bindings.lua`.

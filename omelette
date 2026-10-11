@@ -229,9 +229,16 @@ def load_state():
         return None
 
 
+def private_open(path, flags):
+    """Open a file that only its owner can read, whatever the umask."""
+    fd = os.open(path, flags | os.O_CREAT, 0o600)
+    os.fchmod(fd, 0o600)
+    return os.fdopen(fd, "w")
+
+
 def save_state(state):
     tmp = STATE + ".tmp"
-    with open(tmp, "w") as f:
+    with private_open(tmp, os.O_WRONLY | os.O_TRUNC) as f:
         json.dump(state, f)
     os.replace(tmp, STATE)
 
@@ -375,6 +382,29 @@ def bindings_block(skip=()):
     return "\n".join(lines) + "\n"
 
 
+def write_backup(path, text):
+    """Copy a config file beside itself, never more readable than the original.
+
+    The backup is created owner-only and then given the original's mode, so a
+    private bindings.lua never leaves a world-readable copy behind."""
+    try:
+        mode = os.stat(path).st_mode & 0o777
+    except OSError:
+        mode = 0o600
+    stamp = int(time.time())
+    for n in range(100):
+        backup = f"{path}.bak.omelette.{stamp}" + (f".{n}" if n else "")
+        try:
+            fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        os.fchmod(fd, mode)
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        return backup
+    raise OSError(f"could not create a backup beside {path}")
+
+
 def setup(args):
     path = os.path.expanduser("~/.config/hypr/bindings.lua")
     try:
@@ -400,9 +430,7 @@ def setup(args):
             return 0
         head, rest = current.split(BEGIN, 1)
         updated = head.rstrip("\n") + "\n" + rest.split(END, 1)[1].lstrip("\n")
-        backup = f"{path}.bak.omelette.{int(time.time())}"
-        with open(backup, "w") as f:
-            f.write(current)
+        backup = write_backup(path, current)
         with open(path, "w") as f:
             f.write(updated)
         subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
@@ -420,9 +448,7 @@ def setup(args):
         print("Omelette shortcuts are already up to date.")
         return 0
     if current:
-        backup = f"{path}.bak.omelette.{int(time.time())}"
-        with open(backup, "w") as f:
-            f.write(current)
+        backup = write_backup(path, current)
         print(f"backed up {path} to {backup}")
     with open(path, "w") as f:
         f.write(updated)
@@ -464,7 +490,7 @@ def main():
         return 2
 
     os.makedirs(RUNTIME, exist_ok=True)
-    with open(LOCK, "w") as lock:
+    with private_open(LOCK, os.O_WRONLY) as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
 
         clients, monitors, cursor, active = hypr_state()
