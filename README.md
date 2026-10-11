@@ -77,6 +77,19 @@ block. It backs the file up first and skips any combo something else already use
 reloads Hyprland. Run it again after an update; `omelette setup --print` shows the block
 without writing anything.
 
+## Remove
+
+```bash
+~/.config/omarchy/plugins/ekkostech.omelette/omelette setup --remove
+omarchy plugin remove ekkostech.omelette --yes
+omarchy restart shell
+```
+
+`omelette setup --remove` takes the managed shortcuts block back out of
+`~/.config/hypr/bindings.lua` (backing the file up first) and reloads Hyprland. Nothing
+else is written outside the plugin folder; flip state lives in `$XDG_RUNTIME_DIR` and
+disappears at logout.
+
 **Faster wheel (optional).** Hyprland accepts a wheel shortcut at most every 300 ms. To
 flip faster, add this to `~/.config/hypr/input.lua` (it also speeds up Omarchy's
 Super + scroll workspace switching):
@@ -108,7 +121,7 @@ omelette next|prev [--focused | --window ADDRESS] [--same-app]
 omelette pick      [--focused | --window ADDRESS] [--same-app]
 omelette put ADDRESS --window TILE
 omelette undo
-omelette setup [--print]
+omelette setup [--print | --remove]
 ```
 
 Everything the shortcuts do is a plain command, so you can bind it differently, call it

@@ -155,6 +155,17 @@ class Setup(unittest.TestCase):
             self.assertEqual(self.run_setup(home), 0)
             self.assertEqual(path.read_text(), first)
 
+    def test_remove_takes_the_block_back_out(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = Path(home, ".config/hypr/bindings.lua")
+            path.parent.mkdir(parents=True)
+            path.write_text("-- mine\n")
+            self.run_setup(home)
+            self.assertIn(om.BEGIN, path.read_text())
+            self.assertEqual(self.run_setup(home, args=["--remove"]), 0)
+            self.assertEqual(path.read_text(), "-- mine\n")
+            self.assertEqual(self.run_setup(home, args=["--remove"]), 0)
+
     def test_skips_combos_already_in_use(self):
         with tempfile.TemporaryDirectory() as home:
             path = Path(home, ".config/hypr/bindings.lua")

@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.0.1 (2026-10-11)
+
+- `omelette setup --remove` takes the shortcuts block back out of `bindings.lua`.
+- README: removal instructions.
+- Root `preview.jpg` for the plugin marketplace card.
+
 ## 1.0.0 (2026-10-11)
 
 First release.

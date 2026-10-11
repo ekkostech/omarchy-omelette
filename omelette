@@ -5,11 +5,12 @@
   omelette pick      [--focused | --window ADDR] [--same-app]
   omelette put ADDR --window TILE
   omelette undo
-  omelette setup [--print]
+  omelette setup [--print | --remove]
 
   setup       add Omelette's shortcuts to ~/.config/hypr/bindings.lua (backed
               up first, skipping any combo something else already uses).
-              --print shows the block without writing it.
+              --print shows the block without writing it; --remove takes
+              the block out again (also backed up first).
 
   next, prev  bring the next or previous window into the tile under the
               pointer. --focused uses the focused tile, --same-app only
@@ -392,6 +393,20 @@ def setup(args):
     block = bindings_block(skip)
     if "--print" in args:
         sys.stdout.write(block)
+        return 0
+    if "--remove" in args:
+        if BEGIN not in current or END not in current:
+            print("No Omelette shortcuts block found; nothing to remove.")
+            return 0
+        head, rest = current.split(BEGIN, 1)
+        updated = head.rstrip("\n") + "\n" + rest.split(END, 1)[1].lstrip("\n")
+        backup = f"{path}.bak.omelette.{int(time.time())}"
+        with open(backup, "w") as f:
+            f.write(current)
+        with open(path, "w") as f:
+            f.write(updated)
+        subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
+        print(f"Removed Omelette shortcuts (backup: {backup}).")
         return 0
     if BEGIN in current and END in current:
         head, rest = current.split(BEGIN, 1)
