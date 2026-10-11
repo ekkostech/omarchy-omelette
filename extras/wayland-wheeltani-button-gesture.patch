@@ -1,0 +1,462 @@
+From 70a3e4b3307f2af6d2ba641859f5299cf05b8e9f Mon Sep 17 00:00:00 2001
+From: seann <seann@local>
+Date: Sun, 11 Oct 2026 00:38:01 -0400
+Subject: [PATCH] Add [button_gesture]: hold a button and turn the wheel to run
+ commands
+
+A plain tap with no wheel movement is replayed as a normal click on
+release, so the button keeps its usual job. Used to flip windows with
+Omelette by holding the thumb's back button.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../middle-scroll-linux/src/button_gesture.rs | 260 ++++++++++++++++++
+ .../middle-scroll-linux/src/config_loader.rs  |  30 ++
+ crates/middle-scroll-linux/src/main.rs        |  37 ++-
+ 3 files changed, 324 insertions(+), 3 deletions(-)
+ create mode 100644 crates/middle-scroll-linux/src/button_gesture.rs
+
+diff --git a/crates/middle-scroll-linux/src/button_gesture.rs b/crates/middle-scroll-linux/src/button_gesture.rs
+new file mode 100644
+index 0000000..85dc46e
+--- /dev/null
++++ b/crates/middle-scroll-linux/src/button_gesture.rs
+@@ -0,0 +1,260 @@
++//! Hold-a-button-and-scroll gesture.
++//!
++//! While the configured button (for example the thumb's back button) is held,
++//! wheel detents run `on_wheel_up` / `on_wheel_down` instead of scrolling.
++//! A plain tap, with no wheel turned while it was down, is replayed as a
++//! normal click on release, so the button keeps its usual job.
++//!
++//! Commands are spawned without waiting, rate-limited so a fast spin cannot
++//! queue dozens of processes.
++
++use std::process::{Command, Stdio};
++use std::time::{Duration, Instant};
++
++use evdev::{EventSummary, InputEvent, KeyCode, RelativeAxisCode};
++use middle_scroll_core::MouseButton;
++use tracing::{debug, warn};
++
++#[derive(Debug, Clone, Default, PartialEq, Eq)]
++pub struct ButtonGestureConfig {
++    /// Which button arms the gesture: "side", "extra", "forward" or "back"
++    /// (`BTN_SIDE`, `BTN_EXTRA`, ...). Empty disables the gesture.
++    pub button: String,
++    pub on_wheel_up: Vec<String>,
++    pub on_wheel_down: Vec<String>,
++    pub min_interval_ms: u64,
++}
++
++/// What the event loop should do with an input event.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum Outcome {
++    /// Not ours: route the event as usual.
++    Pass,
++    /// Swallowed by the gesture.
++    Consumed,
++    /// The button was tapped without scrolling: emit a full click now.
++    Click(MouseButton),
++}
++
++#[derive(Debug)]
++pub struct ButtonGesture {
++    key: Option<(KeyCode, MouseButton)>,
++    on_up: Vec<String>,
++    on_down: Vec<String>,
++    min_interval: Duration,
++    held: bool,
++    used: bool,
++    last_fire: Option<Instant>,
++}
++
++fn parse_button(name: &str) -> Option<(KeyCode, MouseButton)> {
++    match name.trim().to_ascii_lowercase().trim_start_matches("btn_") {
++        "side" => Some((KeyCode::BTN_SIDE, MouseButton::Side)),
++        "extra" => Some((KeyCode::BTN_EXTRA, MouseButton::Extra)),
++        "forward" => Some((KeyCode::BTN_FORWARD, MouseButton::Forward)),
++        "back" => Some((KeyCode::BTN_BACK, MouseButton::Back)),
++        _ => None,
++    }
++}
++
++impl ButtonGesture {
++    pub fn new(config: &ButtonGestureConfig) -> Self {
++        let key = if config.button.trim().is_empty() {
++            None
++        } else {
++            let parsed = parse_button(&config.button);
++            if parsed.is_none() {
++                warn!(button = %config.button, "unknown [button_gesture] button; gesture disabled");
++            }
++            parsed
++        };
++        Self {
++            key,
++            on_up: config.on_wheel_up.clone(),
++            on_down: config.on_wheel_down.clone(),
++            min_interval: Duration::from_millis(config.min_interval_ms),
++            held: false,
++            used: false,
++            last_fire: None,
++        }
++    }
++
++    pub const fn enabled(&self) -> bool {
++        self.key.is_some()
++    }
++
++    /// Forget a half-finished gesture (device unplugged mid-hold).
++    pub fn reset(&mut self) {
++        self.held = false;
++        self.used = false;
++    }
++
++    pub fn handle(&mut self, event: &InputEvent) -> Outcome {
++        self.handle_at(event, Instant::now(), true)
++    }
++
++    fn handle_at(&mut self, event: &InputEvent, now: Instant, spawn: bool) -> Outcome {
++        let Some((code, button)) = self.key else {
++            return Outcome::Pass;
++        };
++        match event.destructure() {
++            EventSummary::Key(_, key, value) if key == code => match value {
++                1 => {
++                    self.held = true;
++                    self.used = false;
++                    Outcome::Consumed
++                }
++                0 if self.held => {
++                    self.held = false;
++                    if self.used {
++                        Outcome::Consumed
++                    } else {
++                        Outcome::Click(button)
++                    }
++                }
++                // Autorepeat or a release we never saw pressed.
++                _ => Outcome::Consumed,
++            },
++            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL, value) if self.held => {
++                self.used = true;
++                if value != 0 && self.ready(now) {
++                    self.last_fire = Some(now);
++                    let argv = if value > 0 { &self.on_up } else { &self.on_down };
++                    if spawn {
++                        run(argv);
++                    }
++                }
++                Outcome::Consumed
++            }
++            // The legacy wheel event above drives the commands; its high-res
++            // twin in the same frame must not leak through as a scroll.
++            EventSummary::RelativeAxis(_, RelativeAxisCode::REL_WHEEL_HI_RES, _) if self.held => {
++                self.used = true;
++                Outcome::Consumed
++            }
++            _ => Outcome::Pass,
++        }
++    }
++
++    fn ready(&self, now: Instant) -> bool {
++        self.last_fire
++            .is_none_or(|t| now.saturating_duration_since(t) >= self.min_interval)
++    }
++}
++
++fn run(argv: &[String]) {
++    let Some((program, args)) = argv.split_first() else {
++        return;
++    };
++    match Command::new(program)
++        .args(args)
++        .stdin(Stdio::null())
++        .stdout(Stdio::null())
++        .stderr(Stdio::null())
++        .spawn()
++    {
++        Ok(mut child) => {
++            debug!(%program, "button gesture command spawned");
++            std::thread::spawn(move || {
++                let _ = child.wait();
++            });
++        }
++        Err(err) => warn!(?err, %program, "failed to spawn button gesture command"),
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use evdev::EventType;
++
++    fn key(code: KeyCode, value: i32) -> InputEvent {
++        InputEvent::new(EventType::KEY.0, code.0, value)
++    }
++
++    fn wheel(value: i32) -> InputEvent {
++        InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL.0, value)
++    }
++
++    fn hires(value: i32) -> InputEvent {
++        InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL_HI_RES.0, value)
++    }
++
++    fn motion() -> InputEvent {
++        InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_X.0, 3)
++    }
++
++    fn gesture() -> ButtonGesture {
++        ButtonGesture::new(&ButtonGestureConfig {
++            button: "side".into(),
++            on_wheel_up: vec!["true".into()],
++            on_wheel_down: vec!["true".into()],
++            min_interval_ms: 100,
++        })
++    }
++
++    #[test]
++    fn tap_without_scroll_replays_a_click() {
++        let mut g = gesture();
++        let t = Instant::now();
++        assert_eq!(g.handle_at(&key(KeyCode::BTN_SIDE, 1), t, false), Outcome::Consumed);
++        assert_eq!(g.handle_at(&key(KeyCode::BTN_SIDE, 0), t, false), Outcome::Click(MouseButton::Side));
++    }
++
++    #[test]
++    fn scrolling_while_held_is_swallowed_and_suppresses_the_click() {
++        let mut g = gesture();
++        let t = Instant::now();
++        g.handle_at(&key(KeyCode::BTN_SIDE, 1), t, false);
++        assert_eq!(g.handle_at(&hires(-120), t, false), Outcome::Consumed);
++        assert_eq!(g.handle_at(&wheel(-1), t, false), Outcome::Consumed);
++        assert_eq!(g.handle_at(&key(KeyCode::BTN_SIDE, 0), t, false), Outcome::Consumed);
++    }
++
++    #[test]
++    fn wheel_passes_through_when_not_held() {
++        let mut g = gesture();
++        let t = Instant::now();
++        assert_eq!(g.handle_at(&wheel(1), t, false), Outcome::Pass);
++        assert_eq!(g.handle_at(&hires(120), t, false), Outcome::Pass);
++    }
++
++    #[test]
++    fn motion_and_other_buttons_always_pass() {
++        let mut g = gesture();
++        let t = Instant::now();
++        g.handle_at(&key(KeyCode::BTN_SIDE, 1), t, false);
++        assert_eq!(g.handle_at(&motion(), t, false), Outcome::Pass);
++        assert_eq!(g.handle_at(&key(KeyCode::BTN_LEFT, 1), t, false), Outcome::Pass);
++        assert_eq!(g.handle_at(&key(KeyCode::BTN_EXTRA, 1), t, false), Outcome::Pass);
++    }
++
++    #[test]
++    fn rate_limit_drops_detents_inside_the_interval() {
++        let mut g = gesture();
++        let t = Instant::now();
++        g.handle_at(&key(KeyCode::BTN_SIDE, 1), t, false);
++        g.handle_at(&wheel(1), t, false);
++        assert_eq!(g.last_fire, Some(t));
++        g.handle_at(&wheel(1), t + Duration::from_millis(50), false);
++        assert_eq!(g.last_fire, Some(t));
++        let later = t + Duration::from_millis(120);
++        g.handle_at(&wheel(1), later, false);
++        assert_eq!(g.last_fire, Some(later));
++    }
++
++    #[test]
++    fn empty_button_disables_everything() {
++        let mut g = ButtonGesture::new(&ButtonGestureConfig::default());
++        assert!(!g.enabled());
++        assert_eq!(g.handle(&key(KeyCode::BTN_SIDE, 1)), Outcome::Pass);
++    }
++
++    #[test]
++    fn button_names_parse() {
++        assert!(parse_button("BTN_SIDE").is_some());
++        assert!(parse_button("extra").is_some());
++        assert!(parse_button("Forward").is_some());
++        assert!(parse_button("middle").is_none());
++    }
++}
+diff --git a/crates/middle-scroll-linux/src/config_loader.rs b/crates/middle-scroll-linux/src/config_loader.rs
+index 3319e12..7261b3a 100644
+--- a/crates/middle-scroll-linux/src/config_loader.rs
++++ b/crates/middle-scroll-linux/src/config_loader.rs
+@@ -13,6 +13,7 @@ use crate::cli::Args;
+ use crate::device_discovery::{DeviceInfo, MatchCriteria};
+ use crate::errors::DaemonError;
+ use crate::foreground::{ForegroundConfig, ForegroundFileConfig};
++use crate::button_gesture::ButtonGestureConfig;
+ use crate::indicator::IndicatorConfig;
+ 
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+@@ -26,6 +27,7 @@ pub struct DaemonFileConfig {
+ 
+     pub foreground: Option<ForegroundFileConfig>,
+     pub indicator: Option<IndicatorFileConfig>,
++    pub button_gesture: Option<ButtonGestureFileConfig>,
+ 
+     #[serde(flatten)]
+     pub core: CoreFileConfig,
+@@ -48,6 +50,28 @@ impl IndicatorFileConfig {
+     }
+ }
+ 
++/// On-disk `[button_gesture]` section: hold a mouse button and turn the wheel
++/// to run commands; a plain tap still clicks.
++#[derive(Debug, Clone, Default, Serialize, Deserialize)]
++#[serde(default, deny_unknown_fields)]
++pub struct ButtonGestureFileConfig {
++    pub button: Option<String>,
++    pub on_wheel_up: Option<Vec<String>>,
++    pub on_wheel_down: Option<Vec<String>>,
++    pub min_interval_ms: Option<u64>,
++}
++
++impl ButtonGestureFileConfig {
++    pub fn into_resolved(self) -> ButtonGestureConfig {
++        ButtonGestureConfig {
++            button: self.button.unwrap_or_default(),
++            on_wheel_up: self.on_wheel_up.unwrap_or_default(),
++            on_wheel_down: self.on_wheel_down.unwrap_or_default(),
++            min_interval_ms: self.min_interval_ms.unwrap_or(110),
++        }
++    }
++}
++
+ /// On-disk representation of a stable mouse identifier. Survives reboots and
+ /// USB renumbering because it does not embed `/dev/input/eventXX`.
+ #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+@@ -242,6 +266,7 @@ pub struct ResolvedConfig {
+     pub safety_timeout_seconds: Option<u64>,
+     pub foreground: ForegroundConfig,
+     pub indicator: IndicatorConfig,
++    pub button_gesture: ButtonGestureConfig,
+ }
+ 
+ /// XDG-compliant config directory name. Lowercase by convention (and because
+@@ -308,6 +333,7 @@ pub fn resolve(args: &Args) -> Result<ResolvedConfig, DaemonError> {
+     let mut safety_timeout_seconds = None;
+     let mut foreground = ForegroundConfig::default();
+     let mut indicator = IndicatorConfig::default();
++    let mut button_gesture = ButtonGestureConfig::default();
+ 
+     if let Some(file) = file_cfg {
+         core = file.core.into_core(core);
+@@ -339,6 +365,9 @@ pub fn resolve(args: &Args) -> Result<ResolvedConfig, DaemonError> {
+         if let Some(ind) = file.indicator {
+             indicator = ind.into_resolved();
+         }
++        if let Some(bg) = file.button_gesture {
++            button_gesture = bg.into_resolved();
++        }
+     }
+ 
+     if let Some(v) = args.device.clone() {
+@@ -366,6 +395,7 @@ pub fn resolve(args: &Args) -> Result<ResolvedConfig, DaemonError> {
+         safety_timeout_seconds,
+         foreground,
+         indicator,
++        button_gesture,
+     })
+ }
+ 
+diff --git a/crates/middle-scroll-linux/src/main.rs b/crates/middle-scroll-linux/src/main.rs
+index 3d1267d..76236e9 100644
+--- a/crates/middle-scroll-linux/src/main.rs
++++ b/crates/middle-scroll-linux/src/main.rs
+@@ -12,6 +12,8 @@ mod cli;
+ #[cfg(target_os = "linux")]
+ mod config_loader;
+ #[cfg(target_os = "linux")]
++mod button_gesture;
++#[cfg(target_os = "linux")]
+ mod device_discovery;
+ #[cfg(target_os = "linux")]
+ mod errors;
+@@ -75,17 +77,20 @@ mod linux {
+ 
+     /// Reusable buffers for the hot event path. Both are cleared and refilled
+     /// for every input event / tick, so keeping them alive across iterations
+-    /// avoids two heap allocations per event.
++    /// avoids two heap allocations per event. Also carries the hold-button
++    /// gesture state, which lives as long as the loop does.
+     struct Scratch {
+         actions: Vec<CoreAction>,
+         batch: Vec<CoreAction>,
++        gesture: crate::button_gesture::ButtonGesture,
+     }
+ 
+     impl Scratch {
+-        fn new() -> Self {
++        fn new(gesture: &crate::button_gesture::ButtonGestureConfig) -> Self {
+             Self {
+                 actions: Vec::with_capacity(16),
+                 batch: Vec::with_capacity(16),
++                gesture: crate::button_gesture::ButtonGesture::new(gesture),
+             }
+         }
+     }
+@@ -519,7 +524,10 @@ mod linux {
+         let mut engine = Engine::new(cfg.core.clone());
+         let mut last_state = engine.state();
+         let mut foreground_gate = ForegroundGate::new(cfg.foreground.clone());
+-        let mut scratch = Scratch::new();
++        let mut scratch = Scratch::new(&cfg.button_gesture);
++        if scratch.gesture.enabled() {
++            info!(button = %cfg.button_gesture.button, "button gesture enabled");
++        }
+ 
+         // Initial open is fatal: `run()` already waited for a `device_match` to
+         // appear, so a failure here is a genuine setup problem.
+@@ -563,6 +571,7 @@ mod linux {
+                     }
+                     engine = Engine::new(cfg.core.clone());
+                     last_state = engine.state();
++                    scratch.gesture.reset();
+                     // Drop any latched gesture decision so the gap cannot leave
+                     // a stale foreground decision applied after reconnect.
+                     foreground_gate.reset_latch();
+@@ -765,6 +774,27 @@ mod linux {
+         };
+ 
+         for ev in events {
++            match scratch.gesture.handle(&ev) {
++                crate::button_gesture::Outcome::Pass => {}
++                crate::button_gesture::Outcome::Consumed => continue,
++                crate::button_gesture::Outcome::Click(button) => {
++                    // Press and release in separate frames so every client sees a real click.
++                    for pressed in [true, false] {
++                        let action = CoreAction::ForwardMouseButton { button, pressed };
++                        emit_actions(
++                            std::slice::from_ref(&action),
++                            &mut scratch.batch,
++                            virtual_mouse.as_deref_mut(),
++                            dry_run,
++                            indicator,
++                            engine,
++                            last_state,
++                        )?;
++                    }
++                    continue;
++                }
++            }
++
+             let routed = event_router::classify(&ev);
+             let decision = foreground_gate.decision_for_event(&routed, engine.state());
+ 
+@@ -908,6 +938,7 @@ mod linux {
+                 safety_timeout_seconds: None,
+                 foreground: crate::foreground::ForegroundConfig::default(),
+                 indicator: crate::indicator::IndicatorConfig::default(),
++                button_gesture: crate::button_gesture::ButtonGestureConfig::default(),
+             }
+         }
+ 
+-- 
+2.55.0
+

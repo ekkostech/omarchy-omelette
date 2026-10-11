@@ -1,0 +1,543 @@
+#!/usr/bin/env python3
+"""Omelette: flip any open window into a tile without touching the layout.
+
+  omelette next|prev [--focused | --window ADDR] [--same-app]
+  omelette pick      [--focused | --window ADDR] [--same-app]
+  omelette put ADDR --window TILE
+  omelette undo
+  omelette setup [--print]
+
+  setup       add Omelette's shortcuts to ~/.config/hypr/bindings.lua (backed
+              up first, skipping any combo something else already uses).
+              --print shows the block without writing it.
+
+  next, prev  bring the next or previous window into the tile under the
+              pointer. --focused uses the focused tile, --same-app only
+              cycles windows of the app already in the tile.
+  pick        open a searchable list of windows for that tile.
+  put         drop window ADDR into tile TILE (the picker uses this).
+  undo        put the tile's original window back.
+
+Each flip trades the tile's original window with the window being shown, so
+wherever you stop, exactly two windows have swapped places and every other
+window stays where it was.
+
+Order: windows that want attention come first (urgent, a terminal bell, or an
+agent that finished since you last looked), then windows on other
+workspaces, then windows already on screen; most recently used first within
+each group. The order is fixed for a flip session, which lasts while the tile
+still shows the last window flipped in and the last flip was under
+SESSION_SECONDS ago.
+"""
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+STATE = os.path.join(RUNTIME, "omelette.json")
+LOCK = os.path.join(RUNTIME, "omelette.lock")
+SESSION_SECONDS = 30
+FADE_START = 0.4               # incoming window starts this opaque...
+FADE_STEPS = (0.65, 0.88)       # ...steps up, then lands on its own opacity
+FADE_STEP_SECONDS = 0.04
+SHELL = "/usr/share/omarchy/bin/omarchy-shell"
+IPC = "omelette"
+
+
+# ---------------------------------------------------------------- Hyprland
+
+def hypr_state():
+    """clients, monitors, cursor and active window in one IPC round trip."""
+    out = subprocess.run(
+        ["hyprctl", "-j", "--batch", "clients; monitors; cursorpos; activewindow"],
+        capture_output=True, text=True, timeout=3,
+    ).stdout
+    dec, i, parts = json.JSONDecoder(), 0, []
+    while i < len(out):
+        while i < len(out) and out[i].isspace():
+            i += 1
+        if i >= len(out):
+            break
+        obj, i = dec.raw_decode(out, i)
+        parts.append(obj)
+    while len(parts) < 4:
+        parts.append({})
+    clients, monitors, cursor, active = parts[:4]
+    return clients or [], monitors or [], cursor or {"x": 0, "y": 0}, active or {}
+
+
+def hypr_eval(lua):
+    out = subprocess.run(["hyprctl", "eval", "; ".join(lua)],
+                         capture_output=True, text=True, timeout=3).stdout.strip()
+    if out and "ok" not in out.split():
+        print(f"omelette: hyprctl eval said: {out}", file=sys.stderr)
+
+
+def lua_swap(a, b):
+    return f'hl.dispatch(hl.dsp.window.swap({{ window = "address:{a}", target = "address:{b}" }}))'
+
+
+def lua_focus(a):
+    return f'hl.dispatch(hl.dsp.focus({{ window = "address:{a}" }}))'
+
+
+def lua_opacity(a, value):
+    return f'hl.dispatch(hl.dsp.window.set_prop({{ prop = "opacity", value = "{value:g}", window = "address:{a}" }}))'
+
+
+def window_opacity(a):
+    try:
+        out = subprocess.run(["hyprctl", "getprop", f"address:{a}", "opacity", "-j"],
+                             capture_output=True, text=True, timeout=2).stdout
+        return float(json.loads(out)["opacity"])
+    except (ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return 1.0
+
+
+def start_fade(a, target):
+    """Raise the incoming window's opacity back to its own value in a few quick steps.
+
+    Omarchy turns Hyprland's opacity animation off (so focus changes stay
+    instant); stepping it here fades just this window without touching that."""
+    subprocess.Popen(
+        [sys.executable, os.path.realpath(__file__), "_fade", a, f"{target:g}"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def run_fade(a, target):
+    for v in FADE_STEPS:
+        time.sleep(FADE_STEP_SECONDS)
+        hypr_eval([lua_opacity(a, v * target)])
+    time.sleep(FADE_STEP_SECONDS)
+    hypr_eval([lua_opacity(a, target)])
+
+
+def lua_cursor(x, y):
+    return f"hl.dispatch(hl.dsp.cursor.move({{ x = {int(x)}, y = {int(y)} }}))"
+
+
+def eligible(c):
+    """Tiled windows on normal workspaces that a swap can move."""
+    return (
+        c.get("mapped", True)
+        and not c.get("hidden")
+        and not c.get("floating")
+        and not c.get("pinned")
+        and not c.get("grouped")
+        and c.get("fullscreen", 0) in (0, False)
+        and c["workspace"]["id"] > 0
+        and c["size"][0] > 1
+        and c["size"][1] > 1
+    )
+
+
+def shown_workspaces(monitors):
+    return {m["activeWorkspace"]["id"] for m in monitors}
+
+
+def window_under_pointer(clients, monitors, x, y):
+    shown = set(shown_workspaces(monitors))
+    for m in monitors:
+        special = m.get("specialWorkspace") or {}
+        if special.get("id"):
+            shown.add(special["id"])
+
+    def contains(c):
+        (cx, cy), (w, h) = c["at"], c["size"]
+        return cx <= x < cx + w and cy <= y < cy + h
+
+    hits = [c for c in clients if c["workspace"]["id"] in shown and not c.get("hidden") and contains(c)]
+    # A floating or scratchpad window under the pointer sits on top: leave it alone.
+    if any(c.get("floating") or c["workspace"]["id"] < 0 for c in hits):
+        return None
+    hits = [c for c in hits if eligible(c)]
+    return hits[0] if hits else None
+
+
+# ------------------------------------------------------------ app names
+
+KNOWN_APPS = {
+    "com.mitchellh.ghostty": "Ghostty", "google-chrome": "Chrome", "chromium": "Chromium",
+    "org.omarchy.agent": "Agent", "nemo": "Nemo", "firefox": "Firefox", "code": "VS Code",
+    "obsidian": "Obsidian", "foot": "Foot", "kitty": "Kitty", "alacritty": "Alacritty",
+    "spotify": "Spotify", "steam": "Steam", "signal": "Signal", "org.gnome.nautilus": "Files",
+}
+
+
+def base_class(c):
+    """App identity: restored agent windows (class.restore-<uuid>) count as their app."""
+    cls = c.get("class") or c.get("initialClass") or ""
+    return re.sub(r"\.restore-[0-9a-f-]+$", "", cls)
+
+
+def app_name(c):
+    cls = base_class(c)
+    if cls.lower() in KNOWN_APPS:
+        return KNOWN_APPS[cls.lower()]
+    if re.match(r"^(chrome|brave|msedge)-", cls):
+        return "Web app"
+    last = cls.split(".")[-1]
+    return last[:1].upper() + last[1:] if last else "Window"
+
+
+# ------------------------------------------------------------- shell side
+
+def shell_env():
+    env = dict(os.environ)
+    env.setdefault("OMARCHY_PATH", "/usr/share/omarchy")
+    return env
+
+
+def shell_call(method, payload):
+    """Fire and forget: the overlay must never slow a flip down."""
+    subprocess.Popen(
+        [SHELL, "-q", IPC, method, json.dumps(payload, ensure_ascii=False)],
+        env=shell_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+
+
+def attention_addresses():
+    """Windows the shell flags as wanting attention, as 0x-prefixed addresses."""
+    try:
+        out = subprocess.run([SHELL, "-q", IPC, "attention"], env=shell_env(),
+                             capture_output=True, text=True, timeout=1.5).stdout.strip()
+        return {norm(a) for a in json.loads(out or "[]")}
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return set()
+
+
+def norm(address):
+    a = str(address).lower()
+    return a if a.startswith("0x") else "0x" + a
+
+
+# ------------------------------------------------------------------ state
+
+def load_state():
+    try:
+        with open(STATE) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def save_state(state):
+    tmp = STATE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f)
+    os.replace(tmp, STATE)
+
+
+# ---------------------------------------------------------------- session
+
+def build_ring(tile, pool, monitors, same_app):
+    """Original first, then attention, other workspaces, on screen; MRU within."""
+    origin = tile["address"]
+    shown = shown_workspaces(monitors)
+    flagged = attention_addresses()
+    others = [c for a, c in pool.items() if a != origin]
+    if same_app:
+        others = [c for c in others if base_class(c) == base_class(tile)]
+
+    def rank(c):
+        if norm(c["address"]) in flagged:
+            group = 0
+        elif c["workspace"]["id"] not in shown:
+            group = 1
+        else:
+            group = 2
+        return (group, c.get("focusHistoryID", 1 << 30))
+
+    others.sort(key=rank)
+    ring = [origin] + [c["address"] for c in others]
+    homes = {c["address"]: c["workspace"]["name"] for c in [tile] + others}
+    return ring, homes, sorted(a for a in ring if norm(a) in flagged)
+
+
+def resolve_session(tile, pool, monitors, same_app, now):
+    state = load_state()
+    if (
+        state
+        and now - state.get("ts", 0) < SESSION_SECONDS
+        and state.get("same_app", False) == same_app
+        and state["ring"][state["index"]] == tile["address"]
+        and state["origin"] in pool
+    ):
+        ring = [a for a in state["ring"] if a in pool]
+        return {**state, "ring": ring, "index": ring.index(tile["address"])}
+    ring, homes, flagged = build_ring(tile, pool, monitors, same_app)
+    alpha = {a: v for a, v in ((state or {}).get("alpha") or {}).items() if a in pool}
+    return {
+        "alpha": alpha,
+        "session": f"{int(now * 1000)}",
+        "origin": tile["address"],
+        "ring": ring,
+        "index": 0,
+        "homes": homes,
+        "flagged": flagged,
+        "same_app": same_app,
+        "tile_ws": tile["workspace"]["name"],
+    }
+
+
+def entries(session, by_addr):
+    out = []
+    for a in session["ring"]:
+        c = by_addr.get(a, {})
+        home = session["homes"].get(a, "?")
+        if a == session["origin"]:
+            where = "original"
+        elif home == session["tile_ws"]:
+            where = "this workspace"
+        else:
+            where = f"workspace {home}"
+        out.append({
+            "a": a,
+            "t": (c.get("title") or "").strip(),
+            "c": app_name(c) if c else "Window",
+            "w": where,
+            "att": a in session.get("flagged", []),
+        })
+    return out
+
+
+def tile_box(tile):
+    (x, y), (w, h) = tile["at"], tile["size"]
+    return {"x": x, "y": y, "w": w, "h": h}
+
+
+def move_to(session, j, px, py, on_screen):
+    """Show ring[j] in the tile: send the shown window home, bring ring[j] in."""
+    ring, origin = session["ring"], session["origin"]
+    current, incoming = ring[session["index"]], ring[j]
+    lua = []
+    fade = on_screen and current != incoming and os.environ.get("OMELETTE_FADE", "1") != "0"
+    if fade:
+        # Remember each window's own opacity once, so a fade interrupted by a
+        # fast flip back can never leave a window half transparent.
+        alphas = session.setdefault("alpha", {})
+        if incoming not in alphas:
+            alphas[incoming] = window_opacity(incoming)
+        lua.append(lua_opacity(incoming, FADE_START * alphas[incoming]))
+    if current != incoming:
+        if current != origin:
+            lua.append(lua_swap(current, origin))
+        if incoming != origin:
+            lua.append(lua_swap(incoming, origin))
+    if on_screen:
+        lua.append(lua_focus(incoming))
+    lua.append(lua_cursor(px, py))
+    hypr_eval(lua)
+    session["index"] = j
+    if fade:
+        start_fade(incoming, session["alpha"][incoming])
+
+
+# ------------------------------------------------------------------ setup
+
+BINDINGS = [
+    # (keys, modmask, key as hyprctl reports it, description, arguments)
+    ("SUPER + CTRL + mouse_down", 68, "mouse_down", "next window into tile under pointer", "next"),
+    ("SUPER + CTRL + mouse_up", 68, "mouse_up", "previous window into tile under pointer", "prev"),
+    ("SUPER + CTRL + DOWN", 68, "down", "next window into focused tile", "next --focused"),
+    ("SUPER + CTRL + UP", 68, "up", "previous window into focused tile", "prev --focused"),
+    ("SUPER + CTRL + SHIFT + mouse_down", 69, "mouse_down", "next window of the same app", "next --same-app"),
+    ("SUPER + CTRL + SHIFT + mouse_up", 69, "mouse_up", "previous window of the same app", "prev --same-app"),
+    ("SUPER + CTRL + SHIFT + DOWN", 69, "down", "next same-app window into focused tile", "next --focused --same-app"),
+    ("SUPER + CTRL + SHIFT + UP", 69, "up", "previous same-app window into focused tile", "prev --focused --same-app"),
+    ("SUPER + CTRL + SLASH", 68, "slash", "search windows for the focused tile", "pick --focused"),
+    ("SUPER + CTRL + mouse:274", 68, "mouse:274", "search windows for the tile under pointer", "pick"),
+    ("SUPER + CTRL + ESCAPE", 68, "escape", "put the original window back", "undo"),
+    ("SUPER + CTRL + mouse:273", 68, "mouse:273", "put the original window back", "undo"),
+]
+BEGIN, END = "-- >>> omelette (managed by `omelette setup`)", "-- <<< omelette"
+
+
+def bindings_block(skip=()):
+    lines = [
+        BEGIN,
+        "-- Flip any open window into a tile without disturbing the layout.",
+        "-- The chosen window and the tile's original trade places; nothing else moves.",
+        'local omelette = os.getenv("HOME") .. "/.config/omarchy/plugins/ekkostech.omelette/omelette"',
+    ]
+    for keys, _, _, desc, cmd in BINDINGS:
+        line = f'o.bind("{keys}", "Omelette: {desc}", omelette .. " {cmd}")'
+        lines.append(f"-- {line}  -- skipped: combo already in use" if keys in skip else line)
+    lines.append(END)
+    return "\n".join(lines) + "\n"
+
+
+def setup(args):
+    path = os.path.expanduser("~/.config/hypr/bindings.lua")
+    try:
+        current = open(path).read()
+    except OSError:
+        current = ""
+    taken = set()
+    try:
+        out = subprocess.run(["hyprctl", "binds", "-j"], capture_output=True, text=True, timeout=3).stdout
+        for b in json.loads(out or "[]"):
+            if not str(b.get("description", "")).startswith("Omelette:"):
+                taken.add((b.get("modmask"), str(b.get("key", "")).lower()))
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        pass
+    skip = {keys for keys, mask, key, _, _ in BINDINGS if (mask, key) in taken}
+    block = bindings_block(skip)
+    if "--print" in args:
+        sys.stdout.write(block)
+        return 0
+    if BEGIN in current and END in current:
+        head, rest = current.split(BEGIN, 1)
+        updated = head + block + rest.split(END, 1)[1].lstrip("\n")
+    elif "ekkostech.omelette/omelette" in current:
+        print("bindings.lua already has Omelette bindings outside the managed block; leaving it alone.")
+        return 1
+    else:
+        updated = current.rstrip("\n") + "\n\n" + block
+    if updated == current:
+        print("Omelette shortcuts are already up to date.")
+        return 0
+    if current:
+        backup = f"{path}.bak.omelette.{int(time.time())}"
+        with open(backup, "w") as f:
+            f.write(current)
+        print(f"backed up {path} to {backup}")
+    with open(path, "w") as f:
+        f.write(updated)
+    for keys in sorted(skip):
+        print(f"skipped {keys}: something else already uses it")
+    subprocess.run(["hyprctl", "reload"], capture_output=True, timeout=5)
+    errors = subprocess.run(["hyprctl", "configerrors"], capture_output=True, text=True, timeout=5).stdout.strip()
+    print("Omelette shortcuts installed." if not errors else f"Hyprland reported config errors:\n{errors}")
+    return 0
+
+
+# ------------------------------------------------------------------- main
+
+def option(args, name):
+    return args[args.index(name) + 1] if name in args and args.index(name) + 1 < len(args) else None
+
+
+def pick_tile(args, clients, monitors, cursor, active, by_addr):
+    explicit = option(args, "--window")
+    if explicit:
+        tile = by_addr.get(explicit)
+    elif "--focused" in args:
+        tile = by_addr.get(active.get("address"))
+    else:
+        return window_under_pointer(clients, monitors, int(cursor["x"]), int(cursor["y"]))
+    return tile if tile and eligible(tile) else None
+
+
+def main():
+    args = sys.argv[1:]
+    command = args[0] if args else ""
+    if command == "_fade" and len(args) == 3:
+        run_fade(args[1], float(args[2]))
+        return 0
+    if command == "setup":
+        return setup(args[1:])
+    if command not in ("next", "prev", "pick", "put", "undo"):
+        print(__doc__.strip(), file=sys.stderr)
+        return 2
+
+    os.makedirs(RUNTIME, exist_ok=True)
+    with open(LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+
+        clients, monitors, cursor, active = hypr_state()
+        px, py = int(cursor["x"]), int(cursor["y"])
+        by_addr = {c["address"]: c for c in clients}
+        # Test and demo filters: limit the pool to one class or a few workspaces.
+        only = os.environ.get("OMELETTE_ONLY_CLASS")
+        only_ws = {w.strip() for w in os.environ.get("OMELETTE_ONLY_WORKSPACES", "").split(",") if w.strip()}
+        pool = {
+            c["address"]: c for c in clients
+            if eligible(c)
+            and (not only or c.get("class") == only)
+            and (not only_ws or c["workspace"]["name"] in only_ws)
+        }
+        shown = shown_workspaces(monitors)
+        now = time.time()
+
+        if command == "undo":
+            state = load_state()
+            if not state or state["origin"] not in pool:
+                return 0
+            current = state["ring"][state["index"]]
+            if current not in pool or current == state["origin"]:
+                return 0
+            tile = by_addr[current]
+            on_screen = tile["workspace"]["id"] in shown
+            box = tile_box(tile)
+            state["ring"] = [a for a in state["ring"] if a in pool]
+            state["index"] = state["ring"].index(current)
+            move_to(state, 0, px, py, on_screen)
+            state["ts"] = now
+            save_state(state)
+            if on_screen:
+                shell_call("show", {"seq": int(now * 1000), "session": state["session"], "tile": box,
+                                    "ring": entries(state, by_addr), "index": 0,
+                                    "sameApp": state.get("same_app", False), "note": "Back to the original"})
+            return 0
+
+        if command == "put":
+            want = args[1] if len(args) > 1 else None
+            tile = pick_tile(args, clients, monitors, cursor, active, by_addr)
+            if not tile or want not in pool:
+                return 0
+        else:
+            tile = pick_tile(args, clients, monitors, cursor, active, by_addr)
+            if not tile:
+                return 0
+
+        same_app = "--same-app" in args
+        session = resolve_session(tile, pool, monitors, same_app, now)
+        on_screen = tile["workspace"]["id"] in shown
+        box = tile_box(tile)
+        ring = session["ring"]
+
+        if command == "pick":
+            if on_screen:
+                shell_call("pick", {"seq": int(now * 1000), "session": session["session"], "tile": box,
+                                    "tileAddress": tile["address"], "ring": entries(session, by_addr),
+                                    "index": session["index"], "sameApp": same_app,
+                                    "script": os.path.realpath(__file__)})
+            session["ts"] = now
+            save_state(session)
+            return 0
+
+        if command == "put":
+            if want not in ring:
+                # Not in this session's ring (e.g. a same-app session): start over.
+                session = resolve_session(tile, pool, monitors, False, now + SESSION_SECONDS * 2)
+                session["session"] = f"{int(now * 1000)}"
+                ring = session["ring"]
+            j = ring.index(want)
+        elif len(ring) < 2:
+            if on_screen:
+                shell_call("show", {"seq": int(now * 1000), "session": session["session"], "tile": box,
+                                    "ring": entries(session, by_addr), "index": 0, "sameApp": same_app,
+                                    "note": "No other windows of this app" if same_app else "No other windows to flip in"})
+            return 0
+        else:
+            j = (session["index"] + (1 if command == "next" else -1)) % len(ring)
+
+        move_to(session, j, px, py, on_screen)
+        session["ts"] = now
+        save_state(session)
+        if on_screen:
+            shell_call("show", {"seq": int(now * 1000), "session": session["session"], "tile": box,
+                                "ring": entries(session, by_addr), "index": j, "sameApp": same_app})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
