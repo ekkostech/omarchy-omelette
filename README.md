@@ -15,6 +15,8 @@ exactly where it is. Stop on the one you want and get to work.
 
 ![Flipping windows into the big tile with Super + Ctrl + scroll, searching for one by name, putting the original back, then cycling only Ghostty windows](media/demo.gif)
 
+▶ **[Watch the 22-second trailer](https://github.com/ekkostech/omarchy-omelette/releases/download/v1.0.0/omelette-trailer.mp4)**
+
 No more sliding windows around to make room or hunting through workspaces for the one
 you need. Keep the layout you like and change what's in it.
 
